@@ -13,7 +13,7 @@ OUTPUT_PATH = '/opt/airflow/dags/data/atp_players.csv'
 
 # Task 1: Download CSV content using requests
 def download_csv(**kwargs):
-    logging.info("Downloading CSV file from {CSV_URL}")
+    logging.info(f"Downloading CSV file from {CSV_URL}")
     response = requests.get(CSV_URL)
     response.raise_for_status()  # Raise exception for HTTP errors
     csv_text = response.text

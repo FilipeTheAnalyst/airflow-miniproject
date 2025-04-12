@@ -7,11 +7,17 @@ from airflow import DAG, XComArg
 from airflow.decorators import task, dag
 from airflow.utils.dates import days_ago
 from airflow.models import Variable
+from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
+
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.amazon.aws.operators.s3 import (
     S3DeleteObjectsOperator, S3ListOperator
 )
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.operators.python import BranchPythonOperator
+from airflow.exceptions import AirflowSkipException
+
 
 @dag(
     dag_id="weather_pipeline_dynamic",
@@ -48,11 +54,19 @@ def weather_pipeline_dynamic():
         s3 = S3Hook(aws_conn_id="aws_default")
         bucket = Variable.get("s3_ingest_bucket")
         city = weather_obj["city"]
-        key = f"weather_data/{city.lower()}.json"
+        city_key = city.lower().replace(" ", "_")
+        key = f"weather_data/{city_key}.json"
         data = json.dumps(weather_obj["data"])
         logging.info(f"Uploading data for {city} to S3 at {key}")
         s3.load_string(data, key, bucket_name=bucket, replace=True)
         return key
+    
+    @task
+    def collect_s3_keys():
+        """Reconstruct the list of expected S3 keys after sensors finish."""
+        cities = json.loads(Variable.get("city"))
+        return [f"weather_data/{city.lower().replace(' ', '_')}.json" for city in cities]
+
 
     @task
     def store_to_duckdb(s3_keys: list[str]):
@@ -74,8 +88,19 @@ def weather_pipeline_dynamic():
             con.execute("INSERT INTO weather (city, data) VALUES (?, ?)", (city, content))
 
         logging.info("Stored weather data in DuckDB for all cities.")
+        return "success"
 
-    # fetch the file names from the ingest S3 bucket
+    def branch_decision(**kwargs):
+        result = kwargs["ti"].xcom_pull(task_ids="store_to_duckdb")
+        return "delete_s3_objects" if result == "success" else "notify_failure"
+
+    branch_task = BranchPythonOperator(
+        task_id="branch_decision",
+        python_callable=branch_decision,
+        provide_context=True
+    )
+
+    # List all S3 files before deletion
     list_files_ingest_bucket = S3ListOperator(
         task_id="list_files_ingest_bucket",
         aws_conn_id="aws_default",
@@ -90,20 +115,35 @@ def weather_pipeline_dynamic():
 
     @task(trigger_rule=TriggerRule.ONE_FAILED)
     def notify_failure():
-        """Notify if any upstream task fails."""
         logging.warning("One or more tasks in the weather DAG failed!")
 
     # DAG Execution Flow
     cities = get_cities()
     weather_data = fetch_weather.expand(city=cities)
     s3_keys = upload_to_s3.expand(weather_obj=weather_data)
-    stored = store_to_duckdb(s3_keys)
 
-    # Failure handling
-    [weather_data, stored, list_files_ingest_bucket, delete_s3_objects] >> notify_failure()
+    # TaskGroup remains unchanged
+    with TaskGroup("wait_for_files_group") as wait_for_files_group:
+        for city in json.loads(Variable.get("city", default_var='["London"]')):
+            safe_city = city.lower().replace(" ", "_")
+            S3KeySensor(
+                task_id=f"wait_for_{safe_city}",
+                bucket_name=Variable.get("s3_ingest_bucket"),
+                aws_conn_id="aws_default",
+                poke_interval=10,
+                timeout=120,
+                soft_fail=False,
+                bucket_key=f"weather_data/{safe_city}.json"
+            )
 
-    # set dependencies for tasks not set by the TaskFlowAPI
-    s3_keys >> list_files_ingest_bucket >> stored >> delete_s3_objects
+    s3_keys_final = collect_s3_keys()
+    stored = store_to_duckdb(s3_keys_final)
+
+    # Set dependencies cleanly
+    cities >> weather_data >> s3_keys >> wait_for_files_group >> s3_keys_final >> stored >> branch_task
+    branch_task >> [delete_s3_objects, notify_failure()]
+    [weather_data, stored, delete_s3_objects] >> notify_failure()
+
 
 # Instantiate the DAG
 weather_dag = weather_pipeline_dynamic()

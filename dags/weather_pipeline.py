@@ -2,124 +2,99 @@ import json
 import logging
 import requests
 import duckdb
+
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.decorators import task, dag
 from airflow.utils.dates import days_ago
-from airflow.utils.trigger_rule import TriggerRule
 from airflow.models import Variable
-from airflow.providers.amazon.aws.operators.s3 import (
-    S3CreateObjectOperator, S3ListOperator, S3DeleteObjectsOperator
-)
+from airflow.utils.trigger_rule import TriggerRule
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
-S3_INGEST_BUCKET = Variable.get("s3_ingest_bucket")
-S3_OBJECT_KEY = "weather_data.json"
 
-def fetch_weather_data(**kwargs):
-    city = Variable.get("city", default_var="London")
+@dag(
+    dag_id="weather_pipeline_dynamic",
+    schedule_interval="@daily",
+    start_date=days_ago(1),
+    catchup=False,
+    description="Fetch weather data for multiple cities using dynamic task mapping, store in S3 and DuckDB, and clean up S3",
+)
+def weather_pipeline_dynamic():
 
-    try:
-        url = f'https://wttr.in/{city}?format=j1'
-        logging.info(f"Fetching weather data for %s from %s", city, url)
-        response = requests.get(url)
-        response.raise_for_status()
-        weather_data = response.json()
-        logging.info("Weather data fetched successfully.")
-    except Exception as e:
-        logging.error(f"Error fetching weather data: %s", e)
-        raise
+    @task
+    def get_cities():
+        """Fetch the list of cities from Airflow Variable."""
+        return json.loads(Variable.get("city", default_var='["London"]'))
 
-    kwargs['ti'].xcom_push(key='weather_data', value=json.dumps(weather_data))
+    @task
+    def fetch_weather(city: str):
+        """Fetch weather data for a given city from wttr.in API."""
+        try:
+            url = f'https://wttr.in/{city}?format=j1'
+            logging.info(f"Fetching weather data for {city} from {url}")
+            response = requests.get(url)
+            response.raise_for_status()
+            weather_data = response.json()
+            logging.info(f"Successfully fetched data for {city}")
+            return {"city": city, "data": weather_data}
+        except Exception as e:
+            logging.error(f"Error fetching data for {city}: {e}")
+            raise
 
-def store_weather_data(**kwargs):
-    ti = kwargs['ti']
-    s3_keys = ti.xcom_pull(task_ids='list_s3_weather_files')
+    @task
+    def upload_to_s3(weather_obj: dict):
+        """Upload the weather data for a city to S3."""
+        s3 = S3Hook(aws_conn_id="aws_default")
+        bucket = Variable.get("s3_ingest_bucket")
+        city = weather_obj["city"]
+        key = f"weather_data/{city.lower()}.json"
+        data = json.dumps(weather_obj["data"])
+        logging.info(f"Uploading data for {city} to S3 at {key}")
+        s3.load_string(data, key, bucket_name=bucket, replace=True)
+        return key
 
-    if not s3_keys:
-        logging.error("No files found in S3 to process.")
-        raise ValueError("No files found in S3.")
+    @task
+    def store_to_duckdb(s3_keys: list[str]):
+        """Download weather data from S3 and store it in DuckDB."""
+        s3 = S3Hook(aws_conn_id="aws_default")
+        bucket = Variable.get("s3_ingest_bucket")
+        con = duckdb.connect("dags/data/weather.duckdb", read_only=False)
 
-    s3 = S3Hook(aws_conn_id='aws_default')
-    bucket_name = S3_INGEST_BUCKET
-
-    key = s3_keys[0]
-    logging.info(f"Downloading weather data file from S3: {key}")
-    file_content = s3.read_key(key, bucket_name=bucket_name)
-    weather_data = json.loads(file_content)
-
-    try:
-        con = duckdb.connect('dags/data/weather.duckdb', read_only=False)
         con.execute("""
             CREATE TABLE IF NOT EXISTS weather (
                 city VARCHAR,
                 data JSON
             )
         """)
-        city = Variable.get("city", default_var="London")
-        con.execute(
-            "INSERT INTO weather (city, data) VALUES (?, ?)",
-            (city, json.dumps(weather_data))
-        )
-        logging.info("Weather data stored successfully in DuckDB.")
-    except Exception as e:
-        logging.error("Error storing weather data in DuckDB: %s", e)
-        raise
 
-def notify_failure(**kwargs):
-    logging.warning("One or more tasks in the weather pipeline DAG failed. Please check the logs for details.")
+        for key in s3_keys:
+            content = s3.read_key(key, bucket_name=bucket)
+            city = key.split("/")[-1].replace(".json", "")
+            con.execute("INSERT INTO weather (city, data) VALUES (?, ?)", (city, content))
 
-default_args = {
-    'owner': 'airflow',
-}
+        logging.info("Stored weather data in DuckDB for all cities.")
 
-with DAG(
-    dag_id='weather_pipeline',
-    default_args=default_args,
-    description='A DAG that fetches weather data, stores it in S3 and DuckDB, and cleans up S3',
-    schedule_interval='@daily',
-    start_date=days_ago(1),
-    catchup=False,
-) as dag:
+    @task
+    def delete_s3_objects(s3_keys: list[str]):
+        """Delete the weather files from S3."""
+        s3 = S3Hook(aws_conn_id="aws_default")
+        bucket = Variable.get("s3_ingest_bucket")
+        s3.delete_objects(bucket_name=bucket, keys=s3_keys)
+        logging.info("Deleted weather data files from S3.")
 
-    fetch_weather = PythonOperator(
-        task_id='fetch_weather_data',
-        python_callable=fetch_weather_data,
-        provide_context=True
-    )
+    @task(trigger_rule=TriggerRule.ONE_FAILED)
+    def notify_failure():
+        """Notify if any upstream task fails."""
+        logging.warning("One or more tasks in the weather DAG failed!")
 
-    store_weather_s3 = S3CreateObjectOperator(
-        task_id='store_weather_s3',
-        s3_bucket=S3_INGEST_BUCKET,
-        s3_key=S3_OBJECT_KEY,
-        data="{{ task_instance.xcom_pull(task_ids='fetch_weather_data', key='weather_data') }}",
-        replace=True
-    )
+    # DAG Execution Flow
+    cities = get_cities()
+    weather_data = fetch_weather.expand(city=cities)
+    s3_keys = upload_to_s3.expand(weather_obj=weather_data)
+    stored = store_to_duckdb(s3_keys)
+    deleted = delete_s3_objects(s3_keys)
 
-    list_s3_weather_files = S3ListOperator(
-        task_id='list_s3_weather_files',
-        bucket=S3_INGEST_BUCKET,
-        prefix='weather_data'
-    )
+    # Failure handling
+    [weather_data, stored, deleted] >> notify_failure()
 
-    store_weather = PythonOperator(
-        task_id='store_weather_data',
-        python_callable=store_weather_data,
-        provide_context=True
-    )
-
-    delete_s3_weather_files = S3DeleteObjectsOperator(
-        task_id='delete_s3_weather_files',
-        bucket=S3_INGEST_BUCKET,
-        keys="{{ task_instance.xcom_pull(task_ids='list_s3_weather_files') }}",
-    )
-
-    notify_failure_task = PythonOperator(
-        task_id='notify_failure',
-        python_callable=notify_failure,
-        trigger_rule=TriggerRule.ONE_FAILED
-    )
-
-    # Define DAG dependencies
-    fetch_weather >> store_weather_s3 >> list_s3_weather_files
-    list_s3_weather_files >> store_weather >> delete_s3_weather_files
-    [store_weather_s3, store_weather] >> notify_failure_task
+# Instantiate the DAG
+weather_dag = weather_pipeline_dynamic()

@@ -17,61 +17,22 @@ from airflow.providers.amazon.aws.operators.s3 import (
 )
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.python import BranchPythonOperator
-from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 from airflow.providers.slack.notifications.slack_notifier import SlackNotifier
 from airflow.models import TaskInstance
 from typing import Optional
 
 WEATHER_CITIES = Variable.get("cities", default_var='["London"]')
 S3_INGEST_BUCKET = Variable.get("s3_ingest_bucket")
-SLACK_WEBHOOK_URL = Variable.get("slack_webhook_url")
 SLACK_MESSAGE = """
 Hello! The {{ ti.task_id }} task is saying hi :wave: 
 Today is the {{ ds }} and this task finished with the state: {{ ti.state }} :tada:.
 """
-
-def alert_slack_channel(context: dict):
-    """ Alert to slack channel on failed DAG run
-    
-    :param context: Airflow context object
-    """
-    if not SLACK_WEBHOOK_URL:
-        logging.warning("No Slack webhook URL provided. Skipping alert.")
-        return
-    
-    last_task: Optional[TaskInstance] = context.get("task_instance")
-    dag_name = last_task.dag_id
-    task_name = last_task.task_id
-    error_message = context.get("exception") or context.get("reason")
-    execution_date = context.get("execution_date")
-    dag_run = context.get("dag_run")
-    task_instances = dag_run.get_task_instances()
-    file_and_link_template = "<{log_url}|{name}>"
-    failed_tis = [file_and_link_template.format(log_url=ti.log_url, name=ti.task_id)
-                  for ti in task_instances
-                  if ti.state == 'failed']
-    title = f':red_circle: Dag: *{dag_name}* has failed, with ({len(failed_tis)} failed tasks)'
-    msg_parts = {
-        'Execution Date': execution_date,
-        'Failed Tasks': ', '.join(failed_tis),
-        'Error': error_message
-    }
-    msg = "\n".join([title, *[f"*{key}*: {value}" for key, value in msg_parts.items()]]).strip()
-    @task(
-        on_success_callback=SlackNotifier(
-            slack_conn_id="slack_conn",
-            text=msg,
-            channel="airflow-de-project"
-        ),
-        trigger_rule=TriggerRule.ONE_FAILED
-    ) 
 
 @dag(
     dag_id="weather_pipeline_dynamic",
     schedule_interval="@daily",
     start_date=days_ago(1),
     catchup=False,
-    on_failure_callback=alert_slack_channel,
     description="Fetch weather data for multiple cities using dynamic task mapping, store in S3 and DuckDB, and clean up S3",
 )
 def weather_pipeline_dynamic():
@@ -167,8 +128,18 @@ def weather_pipeline_dynamic():
         aws_conn_id="aws_default",
     ).expand(keys=XComArg(list_files_ingest_bucket))
 
+    @task(
+        on_success_callback=SlackNotifier(
+            slack_conn_id="slack_conn",
+            text=SLACK_MESSAGE,
+            channel="airflow-de-project"
+        ),
+        trigger_rule=TriggerRule.ONE_FAILED
+    )
+    def post_to_slack():
+        return 10
 
-    @task(trigger_rule=TriggerRule.ONE_FAILED, on_success_callback=alert_slack_channel)
+    @task(trigger_rule=TriggerRule.ONE_FAILED)
     def notify_failure():
         logging.warning("One or more tasks in the weather DAG failed!")
 
@@ -196,8 +167,8 @@ def weather_pipeline_dynamic():
 
     # Set dependencies cleanly
     cities >> weather_data >> s3_keys >> wait_for_files_group >> s3_keys_final >> stored >> list_files_ingest_bucket >> branching
-    branching >> [delete_s3_objects, notify_failure()] >> join
-    [weather_data, stored, delete_s3_objects] >> notify_failure()
+    branching >> [delete_s3_objects, post_to_slack()] >> join
+    [weather_data, stored, delete_s3_objects] >> post_to_slack()
 
 
 # Instantiate the DAG

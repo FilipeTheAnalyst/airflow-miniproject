@@ -9,7 +9,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   webserver:
-    image: apache/airflow:2.10.5
+    image: chacalus/airflow-minicourse:latest
     depends_on:
       - postgres
     environment:
@@ -24,7 +24,7 @@ services:
     command: webserver
 
   scheduler:
-    image: apache/airflow:2.10.5
+    image: chacalus/airflow-minicourse:latest
     depends_on:
       - postgres
     environment:

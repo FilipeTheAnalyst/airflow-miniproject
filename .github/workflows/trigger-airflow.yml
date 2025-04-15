@@ -1,0 +1,48 @@
+name: Trigger Airflow DAG
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  trigger-airflow:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      CITIES: ${{ vars.CITIES }}
+      S3_INGEST_BUCKET: ${{ secrets.S3_INGEST_BUCKET }}
+      SLACK_API_TOKEN: ${{ secrets.SLACK_API_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start Airflow
+        run: |
+          docker-compose up -d
+
+      - name: Wait for Airflow to be ready
+        run: |
+          sleep 60  # Can replace with healthcheck logic
+
+      - name: Install dependencies
+        run: |
+          docker exec -ti airflow_minicourse-scheduler \
+                      pip install requests duckdb apache-airflow-providers-slack==8.9.0
+
+      - name: Trigger Airflow DAG
+        run: |
+          docker exec -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+                      -e CITIES \
+                      -e S3_INGEST_BUCKET -e SLACK_API_TOKEN \
+                      -ti airflow_minicourse-webserver \
+                      airflow dags trigger weather_pipeline_dynamic
+
+      - name: Stop containers
+        run: docker-compose down

@@ -2,6 +2,7 @@ import json
 import logging
 import requests
 import duckdb
+import os
 
 from airflow import XComArg
 from airflow.decorators import task, dag
@@ -19,12 +20,13 @@ from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.python import BranchPythonOperator
 from airflow.providers.slack.notifications.slack_notifier import SlackNotifier
 
-WEATHER_CITIES = Variable.get("cities", default_var='["London"]')
-S3_INGEST_BUCKET = Variable.get("s3_ingest_bucket")
+WEATHER_CITIES = os.environ.get("CITIES")
+S3_INGEST_BUCKET = os.environ.get("S3_INGEST_BUCKET")
 SLACK_MESSAGE = """
 Hello! The {{ ti.task_id }} task is saying hi :wave: 
 Today is the {{ ds }} and this task finished with the state: {{ ti.state }} :tada:.
 """
+SLACK_API_TOKEN = os.environ.get("SLACK_API_TOKEN")
 
 @dag(
     dag_id="weather_pipeline_dynamic",
@@ -137,6 +139,19 @@ def weather_pipeline_dynamic():
     def notify_failure():
         logging.warning("One or more tasks in the weather DAG failed!")
 
+    @task(trigger_rule=TriggerRule.ALL_SUCCESS)
+    
+    def notify_success():
+        try:
+            slack_webhook = os.environ.get("SLACK_WEBHOOK_URL")
+            message = {
+                "text": f":white_check_mark: Weather DAG succeeded on {{ ds }}!"
+            }
+            requests.post(slack_webhook, json=message)
+            logging.info("Slack success message sent.")
+        except Exception as e:
+            logging.error(f"Failed to send Slack success notification: {e}")
+
     # DAG Execution Flow
     cities = get_cities()
     weather_data = fetch_weather.expand(city=cities)
@@ -161,7 +176,7 @@ def weather_pipeline_dynamic():
 
     # Set dependencies cleanly
     cities >> weather_data >> s3_keys >> wait_for_files_group >> s3_keys_final >> stored >> list_files_ingest_bucket >> branching
-    branching >> [delete_s3_objects, notify_failure()] >> join
+    branching >> [delete_s3_objects, notify_failure()] >> join >> notify_success()
     [weather_data, stored, delete_s3_objects] >> notify_failure()
 
 

@@ -29,7 +29,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          docker exec -u root airflow-miniproject-scheduler-1 \
+          docker exec -u airflow airflow-miniproject-scheduler-1 \
                       pip install requests duckdb apache-airflow-providers-slack==8.9.0
 
       - name: Trigger Airflow DAG

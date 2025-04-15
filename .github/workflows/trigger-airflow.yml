@@ -29,7 +29,7 @@ jobs:
 
       - name: Airflow db init
         run: |
-          docker compose run --rm webserver airflow db init
+          docker compose run airflow db init
 
       - name: Wait for Airflow to be ready
         run: |

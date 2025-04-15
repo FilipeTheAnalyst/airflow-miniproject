@@ -2,7 +2,7 @@ import json
 import logging
 import requests
 import duckdb
-import os
+from datetime import datetime
 
 from airflow import XComArg
 from airflow.decorators import task, dag
@@ -19,14 +19,15 @@ from airflow.providers.amazon.aws.operators.s3 import (
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.python import BranchPythonOperator
 from airflow.providers.slack.notifications.slack_notifier import SlackNotifier
+from airflow.utils.state import State
 
-WEATHER_CITIES = os.environ.get("CITIES")
-S3_INGEST_BUCKET = os.environ.get("S3_INGEST_BUCKET")
-SLACK_MESSAGE = """
-Hello! The {{ ti.task_id }} task is saying hi :wave: 
-Today is the {{ ds }} and this task finished with the state: {{ ti.state }} :tada:.
+WEATHER_CITIES = Variable.get("cities", default_var='["London"]')
+S3_INGEST_BUCKET = Variable.get("s3_ingest_bucket")
+
+SLACK_SUCCESS_MESSAGE = """
+:white_check_mark: DAG *{{ dag.dag_id }}* succeeded!
+• Execution Date: `{{ ds }}`
 """
-SLACK_API_TOKEN = os.environ.get("SLACK_API_TOKEN")
 
 @dag(
     dag_id="weather_pipeline_dynamic",
@@ -79,24 +80,31 @@ def weather_pipeline_dynamic():
 
     @task
     def store_to_duckdb(s3_keys: list[str]):
-        """Download weather data from S3 and store it in DuckDB."""
+        """Download weather data from S3 and store it in DuckDB with a load timestamp."""
         s3 = S3Hook(aws_conn_id="aws_default")
         bucket = S3_INGEST_BUCKET
         con = duckdb.connect("dags/data/weather.duckdb", read_only=False)
 
+        # Add a load_timestamp column to the table definition
         con.execute("""
             CREATE TABLE IF NOT EXISTS weather (
                 city VARCHAR,
-                data JSON
+                data JSON,
+                load_timestamp TIMESTAMP
             )
         """)
+
+        load_timestamp = datetime.utcnow()
 
         for key in s3_keys:
             content = s3.read_key(key, bucket_name=bucket)
             city = key.split("/")[-1].replace(".json", "")
-            con.execute("INSERT INTO weather (city, data) VALUES (?, ?)", (city, content))
+            con.execute(
+                "INSERT INTO weather (city, data, load_timestamp) VALUES (?, ?, ?)",
+                (city, content, load_timestamp)
+            )
 
-        logging.info("Stored weather data in DuckDB for all cities.")
+        logging.info("Stored weather data in DuckDB for all cities with timestamp.")
         return "success"
 
     def branch_decision(**kwargs):
@@ -128,29 +136,51 @@ def weather_pipeline_dynamic():
         aws_conn_id="aws_default",
     ).expand(keys=XComArg(list_files_ingest_bucket))
 
+    @task(trigger_rule=TriggerRule.ONE_FAILED)
+    def notify_failure(**context):
+        dag_run = context["dag_run"]
+        dag = dag_run.get_dag()
+        failed_tasks = []
+
+        for task in dag.tasks:
+            ti = dag_run.get_task_instance(task.task_id)
+            if ti and ti.state == State.FAILED:
+                failed_tasks.append({
+                    "task_id": ti.task_id,
+                    "execution_date": str(ti.execution_date),
+                    "log_url": ti.log_url,
+                })
+
+        if not failed_tasks:
+            return
+
+        # Build dynamic Slack message
+        message = f":rotating_light: DAG *{dag_run.dag_id}* failed!\n"
+        for task in failed_tasks:
+            message += (
+                f"• *Task:* `{task['task_id']}`\n"
+                f"• *Execution Date:* `{task['execution_date']}`\n"
+                f"• *Log URL:* <{task['log_url']}>\n"
+            )
+
+        # Use SlackNotifier to send the message using Airflow connection
+        notifier = SlackNotifier(
+            slack_conn_id="slack_conn",
+            text=message,
+            channel="airflow-de-project"
+        )
+        notifier(context)
+
     @task(
         on_success_callback=SlackNotifier(
             slack_conn_id="slack_conn",
-            text=SLACK_MESSAGE,
+            text=SLACK_SUCCESS_MESSAGE,
             channel="airflow-de-project"
         ),
-        trigger_rule=TriggerRule.ONE_FAILED
-    )
-    def notify_failure():
-        logging.warning("One or more tasks in the weather DAG failed!")
-
-    @task(trigger_rule=TriggerRule.ALL_SUCCESS)
-    
+        trigger_rule=TriggerRule.ALL_SUCCESS
+        )
     def notify_success():
-        try:
-            slack_webhook = os.environ.get("SLACK_WEBHOOK_URL")
-            message = {
-                "text": f":white_check_mark: Weather DAG succeeded on {{ ds }}!"
-            }
-            requests.post(slack_webhook, json=message)
-            logging.info("Slack success message sent.")
-        except Exception as e:
-            logging.error(f"Failed to send Slack success notification: {e}")
+        logging.info("Weather DAG completed successfully!")
 
     # DAG Execution Flow
     cities = get_cities()
@@ -177,7 +207,6 @@ def weather_pipeline_dynamic():
     # Set dependencies cleanly
     cities >> weather_data >> s3_keys >> wait_for_files_group >> s3_keys_final >> stored >> list_files_ingest_bucket >> branching
     branching >> [delete_s3_objects, notify_failure()] >> join >> notify_success()
-    [weather_data, stored, delete_s3_objects] >> notify_failure()
 
 
 # Instantiate the DAG

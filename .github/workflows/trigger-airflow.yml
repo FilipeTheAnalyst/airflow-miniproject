@@ -31,6 +31,11 @@ jobs:
         run: |
           sleep 30  # Can replace with healthcheck logic
 
+      - name: Docker status check
+        run: |
+          docker ps -a
+          docker logs airflow-miniproject-webserver-1
+
       - name: Trigger Airflow DAG
         run: |
           docker exec -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \

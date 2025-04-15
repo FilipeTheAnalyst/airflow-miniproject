@@ -3,7 +3,7 @@ import logging
 import requests
 import duckdb
 
-from airflow import DAG, XComArg
+from airflow import XComArg
 from airflow.decorators import task, dag
 from airflow.utils.dates import days_ago
 from airflow.models import Variable
@@ -18,8 +18,6 @@ from airflow.providers.amazon.aws.operators.s3 import (
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.python import BranchPythonOperator
 from airflow.providers.slack.notifications.slack_notifier import SlackNotifier
-from airflow.models import TaskInstance
-from typing import Optional
 
 WEATHER_CITIES = Variable.get("cities", default_var='["London"]')
 S3_INGEST_BUCKET = Variable.get("s3_ingest_bucket")
@@ -136,10 +134,6 @@ def weather_pipeline_dynamic():
         ),
         trigger_rule=TriggerRule.ONE_FAILED
     )
-    def post_to_slack():
-        return 10
-
-    @task(trigger_rule=TriggerRule.ONE_FAILED)
     def notify_failure():
         logging.warning("One or more tasks in the weather DAG failed!")
 
@@ -167,8 +161,8 @@ def weather_pipeline_dynamic():
 
     # Set dependencies cleanly
     cities >> weather_data >> s3_keys >> wait_for_files_group >> s3_keys_final >> stored >> list_files_ingest_bucket >> branching
-    branching >> [delete_s3_objects, post_to_slack()] >> join
-    [weather_data, stored, delete_s3_objects] >> post_to_slack()
+    branching >> [delete_s3_objects, notify_failure()] >> join
+    [weather_data, stored, delete_s3_objects] >> notify_failure()
 
 
 # Instantiate the DAG

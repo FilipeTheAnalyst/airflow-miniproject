@@ -27,13 +27,9 @@ jobs:
         run: |
           docker compose up -d
 
-      - name: Wait for Airflow to be ready
-        run: |
-          sleep 60  # Can replace with healthcheck logic
-
       - name: Install dependencies
         run: |
-          docker exec -ti airflow_minicourse-scheduler \
+          docker exec -ti airflow-miniproject-scheduler-1 \
                       pip install requests duckdb apache-airflow-providers-slack==8.9.0
 
       - name: Trigger Airflow DAG
@@ -41,7 +37,7 @@ jobs:
           docker exec -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
                       -e CITIES \
                       -e S3_INGEST_BUCKET -e SLACK_API_TOKEN \
-                      -ti airflow_minicourse-webserver \
+                      -ti airflow-miniproject-webserver-1 \
                       airflow dags trigger weather_pipeline_dynamic
 
       - name: Stop containers

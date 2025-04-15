@@ -23,13 +23,13 @@ jobs:
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
+      - name: Airflow db init
+        run: |
+         docker compose run --rm webserver airflow db init
+      
       - name: Start Airflow
         run: |
           docker compose up -d
-
-      - name: Airflow db init
-        run: |
-          docker compose run --rm airflow db init
 
       - name: Wait for Airflow to be ready
         run: |

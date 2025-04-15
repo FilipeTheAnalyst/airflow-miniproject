@@ -27,6 +27,10 @@ jobs:
         run: |
           docker compose up -d
 
+      - name: Airflow db init
+        run: |
+          docker compose run --rm webserver airflow db init
+
       - name: Wait for Airflow to be ready
         run: |
           sleep 30  # Can replace with healthcheck logic

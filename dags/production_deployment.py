@@ -140,7 +140,6 @@ def weather_pipeline_dynamic():
         logging.warning("One or more tasks in the weather DAG failed!")
 
     @task(trigger_rule=TriggerRule.ALL_SUCCESS)
-    
     def notify_success():
         try:
             slack_webhook = os.environ.get("SLACK_WEBHOOK_URL")
